@@ -22,19 +22,19 @@ The binary will be at `target/release/integrity-test`.
 
 ```bash
 # Basic — point at a cache node and a reference node
-./integrity-test --cache-host qn-tsw-ams-16928 --ref-host qn-tsw-ams-12482
+./integrity-test --cache-host <soltan-cache-host> --ref-host <agave-rpc-host>
 
 # Quieter output (only show failures + summary)
-./integrity-test --cache-host qn-tsw-ams-16928 --ref-host qn-tsw-ams-12482 --skip-verbose
+./integrity-test --cache-host <soltan-cache-host> --ref-host <agave-rpc-host> --skip-verbose
 
 # Higher concurrency (default is 50, each check = 2 HTTP requests)
-./integrity-test --cache-host qn-tsw-ams-16928 --ref-host qn-tsw-ams-12482 --rps 100
+./integrity-test --cache-host <soltan-cache-host> --ref-host <agave-rpc-host> --rps 100
 
 # Custom ports
-./integrity-test --cache-host myhost --ref-host myref --cache-port 8899 --ref-port 8899
+./integrity-test --cache-host <soltan-cache-host> --ref-host <agave-rpc-host> --cache-port 8899 --ref-port 8899
 
 # No color (for piping to files)
-./integrity-test --cache-host myhost --ref-host myref --no-color > results.txt 2>&1
+./integrity-test --cache-host <soltan-cache-host> --ref-host <agave-rpc-host> --no-color > results.txt 2>&1
 ```
 
 The tool auto-discovers the cache range via `getFirstAvailableBlock` and `getSlot`, computes the overlap with the reference node, and runs all three tests sequentially.
@@ -43,8 +43,8 @@ The tool auto-discovers the cache range via `getFirstAvailableBlock` and `getSlo
 
 ```
 === Soltan-Cache Integrity Test ===
-Cache: qn-tsw-ams-16928:8899
-Ref:   qn-tsw-ams-12482:8899
+Cache: soltan-cache-node:8899
+Ref:   agave-rpc-node:8899
 Concurrency: 50
   Cache: 407,853,103 → 407,903,103 (50,000 slots)
   Ref:   407,482,812 → 407,903,103
