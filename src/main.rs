@@ -1,7 +1,8 @@
 use clap::Parser;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
+use rand::Rng;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -34,6 +35,11 @@ struct Args {
     skip_verbose: bool,
     #[arg(long)]
     no_color: bool,
+    /// Randomize non-essential params (encoding, transactionDetails, rewards, etc.) per request
+    /// while keeping the block slot / tx signature fixed. Both cache and reference get the same
+    /// randomized params so responses are still comparable.
+    #[arg(long)]
+    random_payload: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,6 +113,44 @@ const BLOCK_FLAVORS: &[BlockFlavor] = &[
 const TX_ENCODINGS: &[&str] = &["json", "base64", "jsonParsed"];
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Random payload generation
+// ─────────────────────────────────────────────────────────────────────────────
+
+const COMMITMENTS: &[&str] = &["confirmed", "finalized"];
+
+// Valid (encoding, transactionDetails) combos that soltan-cache supports.
+// base64 and jsonParsed only cache "full"; json caches all txDetails variants.
+const BLOCK_COMBOS: &[(&str, &str)] = &[
+    ("json", "full"), ("json", "accounts"), ("json", "signatures"), ("json", "none"),
+    ("base64", "full"),
+    ("jsonParsed", "full"),
+];
+
+fn random_block_params(slot: u64) -> (Value, String) {
+    let mut rng = rand::rng();
+    let &(enc, td) = BLOCK_COMBOS.choose(&mut rng).unwrap();
+    let rewards: bool = rng.random();
+    let commitment = COMMITMENTS.choose(&mut rng).unwrap();
+    let mstv: u8 = if rng.random::<bool>() { 0 } else { rng.random_range(0..=2) };
+    let label = format!("{}_{}_r{}_c{}_v{}", enc, td, rewards as u8, &commitment[..3], mstv);
+    let params = json!([slot, {
+        "encoding": enc, "transactionDetails": td,
+        "maxSupportedTransactionVersion": mstv, "rewards": rewards, "commitment": commitment,
+    }]);
+    (params, label)
+}
+
+fn random_tx_params(sig: &str) -> (Value, String) {
+    let mut rng = rand::rng();
+    let enc = TX_ENCODINGS.choose(&mut rng).unwrap();
+    let commitment = COMMITMENTS.choose(&mut rng).unwrap();
+    let mstv: u8 = if rng.random::<bool>() { 0 } else { rng.random_range(0..=2) };
+    let label = format!("{}_{}_v{}", enc, &commitment[..3], mstv);
+    let params = json!([sig, {"encoding": enc, "commitment": commitment, "maxSupportedTransactionVersion": mstv}]);
+    (params, label)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Semantic JSON comparison (offloaded to blocking thread)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -151,7 +195,10 @@ async fn discover_range(cache: &RpcClient, reference: &RpcClient, no_color: bool
     let cfv = cf["result"].as_u64().unwrap();
     let rc = rs["result"].as_u64().unwrap();
     let rfv = rf["result"].as_u64().unwrap();
-    let start = (cfv + 100).max(rfv);
+    let cache_span = cc - cfv;
+    // Skip the oldest 20% of the cache window to avoid eviction races
+    let safe_start = cfv + cache_span / 5;
+    let start = safe_start.max(rfv);
     let end = cc.min(rc) - 32;
 
     cprint(&format!("  Cache: {} → {} ({} slots)", fmt_num(cfv), fmt_num(cc), fmt_num(cc - cfv)), no_color, None);
@@ -172,59 +219,117 @@ async fn discover_range(cache: &RpcClient, reference: &RpcClient, no_color: bool
 async fn test_blocks(
     cache: &RpcClient, reference: &RpcClient,
     start: u64, end: u64, concurrency: usize, verbose: bool, no_color: bool,
+    random_payload: bool,
 ) -> (usize, usize, Vec<Mismatch>) {
     let slots: Vec<u64> = (start..=end).collect();
-    let total = slots.len() * BLOCK_FLAVORS.len();
-    cprint(&format!("\n--- getBlock Integrity ({} slots x {} encodings = {} checks) ---", fmt_num(slots.len() as u64), BLOCK_FLAVORS.len(), fmt_num(total as u64)), no_color, None);
 
-    let done = Arc::new(AtomicU64::new(0));
-    let passed = Arc::new(AtomicU64::new(0));
-    let mismatches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    if random_payload {
+        // Random mode: 1 random param combo per slot
+        let total = slots.len();
+        cprint(&format!("\n--- getBlock Integrity [RANDOM PAYLOAD] ({} slots x 1 random combo = {} checks) ---", fmt_num(slots.len() as u64), fmt_num(total as u64)), no_color, None);
 
-    let tasks: Vec<_> = slots.iter().flat_map(|&s| BLOCK_FLAVORS.iter().map(move |f| (s, f))).collect();
+        let done = Arc::new(AtomicU64::new(0));
+        let passed = Arc::new(AtomicU64::new(0));
+        let mismatches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-    stream::iter(tasks)
-        .for_each_concurrent(concurrency, |(slot, flavor)| {
-            let done = done.clone();
-            let passed = passed.clone();
-            let mismatches = mismatches.clone();
-            async move {
-                let params = json!([slot, {
-                    "encoding": flavor.encoding, "transactionDetails": flavor.tx_details,
-                    "maxSupportedTransactionVersion": 0, "rewards": false, "commitment": "confirmed",
-                }]);
-                let (cr, rr) = tokio::join!(
-                    cache.call_safe("getBlock", params.clone()),
-                    reference.call_safe("getBlock", params),
-                );
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                let ch = has_data(&cr);
-                let rh = has_data(&rr);
+        // Pre-generate random params per slot so both cache & ref get the same
+        let tasks: Vec<_> = slots.iter().map(|&s| {
+            let (params, label) = random_block_params(s);
+            (s, params, label)
+        }).collect();
 
-                if !ch && !rh {
-                    passed.fetch_add(1, Ordering::Relaxed);
-                } else if ch && rh {
-                    if semantic_equal(cr["result"].clone(), rr["result"].clone()).await {
+        stream::iter(tasks)
+            .for_each_concurrent(concurrency, |(slot, params, label)| {
+                let done = done.clone();
+                let passed = passed.clone();
+                let mismatches = mismatches.clone();
+                async move {
+                    let (cr, rr) = tokio::join!(
+                        cache.call_safe("getBlock", params.clone()),
+                        reference.call_safe("getBlock", params),
+                    );
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let ch = has_data(&cr);
+                    let rh = has_data(&rr);
+
+                    if !ch && !rh {
                         passed.fetch_add(1, Ordering::Relaxed);
-                        if verbose { cprint(&format!("  [PASS] slot {} {} ({}/{})", slot, flavor.name, d, total), no_color, Some("green")); }
+                    } else if ch && rh {
+                        if semantic_equal(cr["result"].clone(), rr["result"].clone()).await {
+                            passed.fetch_add(1, Ordering::Relaxed);
+                            if verbose { cprint(&format!("  [PASS] slot {} {} ({}/{})", slot, label, d, total), no_color, Some("green")); }
+                        } else {
+                            cprint(&format!("  [FAIL] slot {} {}: data mismatch ({}/{})", slot, label, d, total), no_color, Some("red"));
+                            mismatches.lock().await.push(Mismatch { detail: format!("data mismatch ({})", label) });
+                        }
                     } else {
-                        cprint(&format!("  [FAIL] slot {} {}: data mismatch ({}/{})", slot, flavor.name, d, total), no_color, Some("red"));
-                        mismatches.lock().await.push(Mismatch { detail: "data mismatch".into() });
+                        let detail = if ch { "cache has data, ref doesn't".into() } else { format!("ref has data, cache: {}", get_error_msg(&cr)) };
+                        cprint(&format!("  [FAIL] slot {} {}: {} ({}/{})", slot, label, detail, d, total), no_color, Some("red"));
+                        mismatches.lock().await.push(Mismatch { detail });
                     }
-                } else {
-                    let detail = if ch { "cache has data, ref doesn't".into() } else { format!("ref has data, cache: {}", get_error_msg(&cr)) };
-                    cprint(&format!("  [FAIL] slot {} {}: {} ({}/{})", slot, flavor.name, detail, d, total), no_color, Some("red"));
-                    mismatches.lock().await.push(Mismatch { detail });
+                    if d % 1000 == 0 { cprint(&format!("  Progress: {}/{}", fmt_num(d), fmt_num(total as u64)), no_color, None); }
                 }
-                if d % 1000 == 0 { cprint(&format!("  Progress: {}/{}", fmt_num(d), fmt_num(total as u64)), no_color, None); }
-            }
-        }).await;
+            }).await;
 
-    let p = passed.load(Ordering::Relaxed) as usize;
-    let mm = mismatches.lock().await.clone();
-    let c = if mm.is_empty() { "green" } else { "red" };
-    cprint(&format!("  Result: {}/{} passed", fmt_num(p as u64), fmt_num(total as u64)), no_color, Some(c));
-    (p, total, mm)
+        let p = passed.load(Ordering::Relaxed) as usize;
+        let mm = mismatches.lock().await.clone();
+        let c = if mm.is_empty() { "green" } else { "red" };
+        cprint(&format!("  Result: {}/{} passed", fmt_num(p as u64), fmt_num(total as u64)), no_color, Some(c));
+        (p, total, mm)
+    } else {
+        // Original mode: all encoding flavors per slot
+        let total = slots.len() * BLOCK_FLAVORS.len();
+        cprint(&format!("\n--- getBlock Integrity ({} slots x {} encodings = {} checks) ---", fmt_num(slots.len() as u64), BLOCK_FLAVORS.len(), fmt_num(total as u64)), no_color, None);
+
+        let done = Arc::new(AtomicU64::new(0));
+        let passed = Arc::new(AtomicU64::new(0));
+        let mismatches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let tasks: Vec<_> = slots.iter().flat_map(|&s| BLOCK_FLAVORS.iter().map(move |f| (s, f))).collect();
+
+        stream::iter(tasks)
+            .for_each_concurrent(concurrency, |(slot, flavor)| {
+                let done = done.clone();
+                let passed = passed.clone();
+                let mismatches = mismatches.clone();
+                async move {
+                    let params = json!([slot, {
+                        "encoding": flavor.encoding, "transactionDetails": flavor.tx_details,
+                        "maxSupportedTransactionVersion": 0, "rewards": false, "commitment": "confirmed",
+                    }]);
+                    let (cr, rr) = tokio::join!(
+                        cache.call_safe("getBlock", params.clone()),
+                        reference.call_safe("getBlock", params),
+                    );
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let ch = has_data(&cr);
+                    let rh = has_data(&rr);
+
+                    if !ch && !rh {
+                        passed.fetch_add(1, Ordering::Relaxed);
+                    } else if ch && rh {
+                        if semantic_equal(cr["result"].clone(), rr["result"].clone()).await {
+                            passed.fetch_add(1, Ordering::Relaxed);
+                            if verbose { cprint(&format!("  [PASS] slot {} {} ({}/{})", slot, flavor.name, d, total), no_color, Some("green")); }
+                        } else {
+                            cprint(&format!("  [FAIL] slot {} {}: data mismatch ({}/{})", slot, flavor.name, d, total), no_color, Some("red"));
+                            mismatches.lock().await.push(Mismatch { detail: "data mismatch".into() });
+                        }
+                    } else {
+                        let detail = if ch { "cache has data, ref doesn't".into() } else { format!("ref has data, cache: {}", get_error_msg(&cr)) };
+                        cprint(&format!("  [FAIL] slot {} {}: {} ({}/{})", slot, flavor.name, detail, d, total), no_color, Some("red"));
+                        mismatches.lock().await.push(Mismatch { detail });
+                    }
+                    if d % 1000 == 0 { cprint(&format!("  Progress: {}/{}", fmt_num(d), fmt_num(total as u64)), no_color, None); }
+                }
+            }).await;
+
+        let p = passed.load(Ordering::Relaxed) as usize;
+        let mm = mismatches.lock().await.clone();
+        let c = if mm.is_empty() { "green" } else { "red" };
+        cprint(&format!("  Result: {}/{} passed", fmt_num(p as u64), fmt_num(total as u64)), no_color, Some(c));
+        (p, total, mm)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,8 +339,10 @@ async fn test_blocks(
 async fn test_transactions(
     cache: &RpcClient, reference: &RpcClient,
     start: u64, end: u64, concurrency: usize, verbose: bool, no_color: bool,
+    random_payload: bool,
 ) -> (usize, usize, Vec<Mismatch>) {
-    cprint("\n--- getTransaction Integrity ---", no_color, None);
+    let mode_label = if random_payload { " [RANDOM PAYLOAD]" } else { "" };
+    cprint(&format!("\n--- getTransaction Integrity{} ---", mode_label), no_color, None);
 
     // Pick 1 sig from every ~100th slot across the range
     let span = end - start;
@@ -268,56 +375,112 @@ async fn test_transactions(
         return (0, 0, vec![]);
     }
 
-    let total = sig_pairs.len() * TX_ENCODINGS.len();
-    let unique: BTreeSet<u64> = sig_pairs.iter().map(|(_, s)| *s).collect();
-    cprint(&format!("  Testing {} signatures from {} slots x {} encodings = {} checks", sig_pairs.len(), unique.len(), TX_ENCODINGS.len(), total), no_color, None);
+    if random_payload {
+        let total = sig_pairs.len();
+        let unique: BTreeSet<u64> = sig_pairs.iter().map(|(_, s)| *s).collect();
+        cprint(&format!("  Testing {} signatures from {} slots x 1 random combo = {} checks", sig_pairs.len(), unique.len(), total), no_color, None);
 
-    let done = Arc::new(AtomicU64::new(0));
-    let passed = Arc::new(AtomicU64::new(0));
-    let mismatches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicU64::new(0));
+        let passed = Arc::new(AtomicU64::new(0));
+        let mismatches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-    let tasks: Vec<_> = sig_pairs.iter().flat_map(|(sig, slot)| TX_ENCODINGS.iter().map(move |enc| (sig.clone(), *slot, *enc))).collect();
+        // Pre-generate random params per sig
+        let tasks: Vec<_> = sig_pairs.iter().map(|(sig, slot)| {
+            let (params, label) = random_tx_params(sig);
+            (sig.clone(), *slot, params, label)
+        }).collect();
 
-    stream::iter(tasks)
-        .for_each_concurrent(concurrency, |(sig, slot, enc)| {
-            let done = done.clone();
-            let passed = passed.clone();
-            let mismatches = mismatches.clone();
-            async move {
-                let params = json!([sig, {"encoding": enc, "commitment": "confirmed", "maxSupportedTransactionVersion": 0}]);
-                let (cr, rr) = tokio::join!(
-                    cache.call_safe("getTransaction", params.clone()),
-                    reference.call_safe("getTransaction", params),
-                );
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                let ch = has_data(&cr);
-                let rh = has_data(&rr);
-                let ss = &sig[..16.min(sig.len())];
+        stream::iter(tasks)
+            .for_each_concurrent(concurrency, |(sig, slot, params, label)| {
+                let done = done.clone();
+                let passed = passed.clone();
+                let mismatches = mismatches.clone();
+                async move {
+                    let (cr, rr) = tokio::join!(
+                        cache.call_safe("getTransaction", params.clone()),
+                        reference.call_safe("getTransaction", params),
+                    );
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let ch = has_data(&cr);
+                    let rh = has_data(&rr);
+                    let ss = &sig[..16.min(sig.len())];
 
-                if !ch && !rh {
-                    passed.fetch_add(1, Ordering::Relaxed);
-                } else if ch && rh {
-                    if semantic_equal(cr["result"].clone(), rr["result"].clone()).await {
+                    if !ch && !rh {
                         passed.fetch_add(1, Ordering::Relaxed);
-                        if verbose { cprint(&format!("  [PASS] tx {}... ({}) slot {} ({}/{})", ss, enc, slot, d, total), no_color, Some("green")); }
+                    } else if ch && rh {
+                        if semantic_equal(cr["result"].clone(), rr["result"].clone()).await {
+                            passed.fetch_add(1, Ordering::Relaxed);
+                            if verbose { cprint(&format!("  [PASS] tx {}... ({}) slot {} ({}/{})", ss, label, slot, d, total), no_color, Some("green")); }
+                        } else {
+                            cprint(&format!("  [FAIL] tx {}... ({}) slot {}: data mismatch ({}/{})", ss, label, slot, d, total), no_color, Some("red"));
+                            mismatches.lock().await.push(Mismatch { detail: format!("data mismatch ({})", label) });
+                        }
                     } else {
-                        cprint(&format!("  [FAIL] tx {}... ({}) slot {}: data mismatch ({}/{})", ss, enc, slot, d, total), no_color, Some("red"));
-                        mismatches.lock().await.push(Mismatch { detail: "data mismatch".into() });
+                        let detail = if ch { "cache has data, ref doesn't".into() } else { format!("ref has data, cache: {}", get_error_msg(&cr)) };
+                        cprint(&format!("  [FAIL] tx {}... ({}) slot {}: {} ({}/{})", ss, label, slot, detail, d, total), no_color, Some("red"));
+                        mismatches.lock().await.push(Mismatch { detail });
                     }
-                } else {
-                    let detail = if ch { "cache has data, ref doesn't".into() } else { format!("ref has data, cache: {}", get_error_msg(&cr)) };
-                    cprint(&format!("  [FAIL] tx {}... ({}) slot {}: {} ({}/{})", ss, enc, slot, detail, d, total), no_color, Some("red"));
-                    mismatches.lock().await.push(Mismatch { detail });
+                    if d % 200 == 0 { cprint(&format!("  Progress: {}/{}", d, total), no_color, None); }
                 }
-                if d % 200 == 0 { cprint(&format!("  Progress: {}/{}", d, total), no_color, None); }
-            }
-        }).await;
+            }).await;
 
-    let p = passed.load(Ordering::Relaxed) as usize;
-    let mm = mismatches.lock().await.clone();
-    let c = if mm.is_empty() { "green" } else { "red" };
-    cprint(&format!("  Result: {}/{} passed", p, total), no_color, Some(c));
-    (p, total, mm)
+        let p = passed.load(Ordering::Relaxed) as usize;
+        let mm = mismatches.lock().await.clone();
+        let c = if mm.is_empty() { "green" } else { "red" };
+        cprint(&format!("  Result: {}/{} passed", p, total), no_color, Some(c));
+        (p, total, mm)
+    } else {
+        let total = sig_pairs.len() * TX_ENCODINGS.len();
+        let unique: BTreeSet<u64> = sig_pairs.iter().map(|(_, s)| *s).collect();
+        cprint(&format!("  Testing {} signatures from {} slots x {} encodings = {} checks", sig_pairs.len(), unique.len(), TX_ENCODINGS.len(), total), no_color, None);
+
+        let done = Arc::new(AtomicU64::new(0));
+        let passed = Arc::new(AtomicU64::new(0));
+        let mismatches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let tasks: Vec<_> = sig_pairs.iter().flat_map(|(sig, slot)| TX_ENCODINGS.iter().map(move |enc| (sig.clone(), *slot, *enc))).collect();
+
+        stream::iter(tasks)
+            .for_each_concurrent(concurrency, |(sig, slot, enc)| {
+                let done = done.clone();
+                let passed = passed.clone();
+                let mismatches = mismatches.clone();
+                async move {
+                    let params = json!([sig, {"encoding": enc, "commitment": "confirmed", "maxSupportedTransactionVersion": 0}]);
+                    let (cr, rr) = tokio::join!(
+                        cache.call_safe("getTransaction", params.clone()),
+                        reference.call_safe("getTransaction", params),
+                    );
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let ch = has_data(&cr);
+                    let rh = has_data(&rr);
+                    let ss = &sig[..16.min(sig.len())];
+
+                    if !ch && !rh {
+                        passed.fetch_add(1, Ordering::Relaxed);
+                    } else if ch && rh {
+                        if semantic_equal(cr["result"].clone(), rr["result"].clone()).await {
+                            passed.fetch_add(1, Ordering::Relaxed);
+                            if verbose { cprint(&format!("  [PASS] tx {}... ({}) slot {} ({}/{})", ss, enc, slot, d, total), no_color, Some("green")); }
+                        } else {
+                            cprint(&format!("  [FAIL] tx {}... ({}) slot {}: data mismatch ({}/{})", ss, enc, slot, d, total), no_color, Some("red"));
+                            mismatches.lock().await.push(Mismatch { detail: "data mismatch".into() });
+                        }
+                    } else {
+                        let detail = if ch { "cache has data, ref doesn't".into() } else { format!("ref has data, cache: {}", get_error_msg(&cr)) };
+                        cprint(&format!("  [FAIL] tx {}... ({}) slot {}: {} ({}/{})", ss, enc, slot, detail, d, total), no_color, Some("red"));
+                        mismatches.lock().await.push(Mismatch { detail });
+                    }
+                    if d % 200 == 0 { cprint(&format!("  Progress: {}/{}", d, total), no_color, None); }
+                }
+            }).await;
+
+        let p = passed.load(Ordering::Relaxed) as usize;
+        let mm = mismatches.lock().await.clone();
+        let c = if mm.is_empty() { "green" } else { "red" };
+        cprint(&format!("  Result: {}/{} passed", p, total), no_color, Some(c));
+        (p, total, mm)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -467,6 +630,7 @@ async fn main() -> ExitCode {
     cprint(&format!("Cache: {}:{}", args.cache_host, args.cache_port), no_color, None);
     cprint(&format!("Ref:   {}:{}", args.ref_host, args.ref_port), no_color, None);
     cprint(&format!("Concurrency: {}", concurrency), no_color, None);
+    if args.random_payload { cprint("Mode: RANDOM PAYLOAD (randomized encoding/txDetails/rewards/commitment/mstv per request)", no_color, Some("yellow")); }
 
     let build_client = || Client::builder()
         .pool_max_idle_per_host(concurrency)
@@ -485,11 +649,11 @@ async fn main() -> ExitCode {
     let mut exit_code = 0;
 
     // 1. getBlock — full range, all encodings
-    let (bp, bt, bmm) = test_blocks(&cache, &reference, start, end, concurrency, verbose, no_color).await;
+    let (bp, bt, bmm) = test_blocks(&cache, &reference, start, end, concurrency, verbose, no_color, args.random_payload).await;
     if !bmm.is_empty() { exit_code = 1; }
 
     // 2. getTransaction — sampled across full range
-    let (tp, tt, tmm) = test_transactions(&cache, &reference, start, end, concurrency, verbose, no_color).await;
+    let (tp, tt, tmm) = test_transactions(&cache, &reference, start, end, concurrency, verbose, no_color, args.random_payload).await;
     if !tmm.is_empty() { exit_code = 1; }
 
     // 3. Skipped slot detection — full range
