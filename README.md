@@ -35,9 +35,14 @@ The binary will be at `target/release/integrity-test`.
 
 # No color (for piping to files)
 ./integrity-test --cache-host <soltan-cache-host> --ref-host <agave-rpc-host> --no-color > results.txt 2>&1
+
+# Random payload mode — randomizes encoding, transactionDetails, rewards, commitment,
+# and maxSupportedTransactionVersion per request (slot/signature stays fixed).
+# Both cache and reference get the same randomized params so responses are still comparable.
+./integrity-test --cache-host <soltan-cache-host> --ref-host <agave-rpc-host> --random-payload
 ```
 
-The tool auto-discovers the cache range via `getFirstAvailableBlock` and `getSlot`, computes the overlap with the reference node, and runs all three tests sequentially.
+The tool auto-discovers the cache range via `getFirstAvailableBlock` and `getSlot`, computes the overlap with the reference node, and runs all three tests sequentially. A 20% margin is applied to the oldest edge of the cache window to avoid false positives from cache eviction during the test.
 
 ## Output
 
@@ -77,10 +82,33 @@ EXIT CODE: 1
 
 Exit code is `0` if all tests pass, `1` if any issues are found.
 
+## Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cache-host` | required | Soltan-cache node hostname |
+| `--ref-host` | required | Agave reference node hostname |
+| `--cache-port` | 8899 | Cache node RPC port |
+| `--ref-port` | 8899 | Reference node RPC port |
+| `--rps` | 50 | Max concurrent checks (each check = 2 HTTP requests) |
+| `--skip-verbose` | false | Only show failures and summary |
+| `--no-color` | false | Disable colored output (for piping to files) |
+| `--random-payload` | false | Randomize non-essential params per request |
+
+### `--random-payload`
+
+Instead of testing all fixed encoding flavors, each slot/signature gets one randomly generated param combination:
+
+- **getBlock**: randomizes `encoding` (json/base64/jsonParsed), `transactionDetails` (full/accounts/signatures/none), `rewards` (true/false), `commitment` (confirmed/finalized), `maxSupportedTransactionVersion` (0-2). Only valid combos are generated (e.g. `base64` only with `full` txDetails).
+- **getTransaction**: randomizes `encoding` (json/base64/jsonParsed), `commitment` (confirmed/finalized), `maxSupportedTransactionVersion` (0-2).
+
+Each check label shows the exact combo used, e.g. `json_accounts_r1_ccon_v0` = json encoding, accounts txDetails, rewards=true, confirmed, mstv=0.
+
 ## Known differences
 
 Soltan-cache serializes some fields differently from agave-rpc:
 - **`null` vs `[]`** — For vote transactions with no logs or inner instructions, agave returns `logMessages: null` and `innerInstructions: null`, while soltan-cache returns empty arrays `[]`. This is a serialization difference, not a data integrity issue. These will show up as `data mismatch` in the output.
+- **Missing `rewards` key on empty blocks** — When a block has 0 rewards and `rewards: true` is requested, the cache omits the `"rewards"` key entirely while agave returns `"rewards": []`. This only occurs on rare empty blocks (0 transactions, 0 rewards).
 
 ## How it works
 
@@ -88,4 +116,4 @@ Soltan-cache serializes some fields differently from agave-rpc:
 - Concurrency is controlled via `for_each_concurrent` — `--rps 50` means 50 checks running in parallel, each check fires 2 requests (one to cache, one to reference) via `tokio::join!`
 - JSON comparison uses recursive deep-sort + equality check, offloaded to `spawn_blocking` to avoid starving the tokio runtime with CPU work on large (1-10 MB) block responses
 - Retries transient HTTP errors up to 3 times with backoff
-- Trims 100 slots from the oldest edge and 32 from the tip to avoid false positives from cache eviction during the test
+- Skips the oldest 100 slots of the cache window to avoid false positives from eviction (the test walks oldest→newest, so the oldest slots are most at risk). Trims 32 slots from the tip to avoid querying unconfirmed slots.
