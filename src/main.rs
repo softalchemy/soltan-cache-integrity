@@ -195,10 +195,7 @@ async fn discover_range(cache: &RpcClient, reference: &RpcClient, no_color: bool
     let cfv = cf["result"].as_u64().unwrap();
     let rc = rs["result"].as_u64().unwrap();
     let rfv = rf["result"].as_u64().unwrap();
-    let cache_span = cc - cfv;
-    // Skip the oldest 20% of the cache window to avoid eviction races
-    let safe_start = cfv + cache_span / 5;
-    let start = safe_start.max(rfv);
+    let start = (cfv + 100).max(rfv);
     let end = cc.min(rc) - 32;
 
     cprint(&format!("  Cache: {} → {} ({} slots)", fmt_num(cfv), fmt_num(cc), fmt_num(cc - cfv)), no_color, None);
